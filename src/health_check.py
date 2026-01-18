@@ -1,101 +1,134 @@
+#!/usr/bin/env python3
+"""
+System Health Checker (macOS)
+Exit codes:
+0 = OK
+1 = WARNING
+2 = CRITICAL
+"""
+
 import os
-import shutil
 import subprocess
-import time
+import shutil
 from datetime import datetime
 
+
+def run(cmd):
+    return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+
+
+def bytes_to_gb(b):
+    return round(b / (1024 ** 3), 2)
+
+
+# -------------------------
+# System checks
+# -------------------------
+
 def cpu_load():
-    load1, load5, load15 = os.getloadavg()
-    return {
-        "1min": round(load1, 2),
-        "5min": round(load5, 2),
-        "15min": round(load15, 2)
-    }
+    load1 = os.getloadavg()[0]
+    cores = os.cpu_count() or 1
+    return round((load1 / cores) * 100, 2)
+
 
 def memory_info():
-    total_bytes = int(subprocess.check_output(
-        ["sysctl", "-n", "hw.memsize"]
-    ).strip())
+    page_size = int(run(["sysctl", "-n", "hw.pagesize"]))
+    total_bytes = int(run(["sysctl", "-n", "hw.memsize"]))
 
-    vm_stat = subprocess.check_output(["vm_stat"]).decode()
-    pages_free = pages_active = pages_inactive = pages_spec = 0
+    vm = run(["vm_stat"]).splitlines()
+    stats = {}
 
-    for line in vm_stat.splitlines():
-        if "Pages free" in line:
-            pages_free = int(line.split(":")[1].strip().strip("."))
-        elif "Pages active" in line:
-            pages_active = int(line.split(":")[1].strip().strip("."))
-        elif "Pages inactive" in line:
-            pages_inactive = int(line.split(":")[1].strip().strip("."))
-        elif "Pages speculative" in line:
-            pages_spec = int(line.split(":")[1].strip().strip("."))
+    for line in vm:
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        val = val.strip().replace(".", "")
+        if not val.isdigit():
+            continue
+        stats[key.strip()] = int(val)
 
-    page_size = 4096
-    available = (pages_free + pages_inactive + pages_spec) * page_size
+    free_pages = stats.get("Pages free", 0)
+    inactive_pages = stats.get("Pages inactive", 0)
+
+    available_bytes = (free_pages + inactive_pages) * page_size
 
     return {
-        "total_gb": round(total_bytes / (1024**3), 2),
-        "available_gb": round(available / (1024**3), 2)
+        "total_gb": bytes_to_gb(total_bytes),
+        "available_gb": bytes_to_gb(available_bytes),
     }
+
 
 def disk_usage(path="/"):
-    usage = shutil.disk_usage(path)
+    total, used, free = shutil.disk_usage(path)
     return {
-        "total_gb": round(usage.total / (1024**3), 2),
-        "used_gb": round(usage.used / (1024**3), 2),
-        "free_gb": round(usage.free / (1024**3), 2),
-        "used_pct": round((usage.used / usage.total) * 100, 2)
+        "used_pct": round((used / total) * 100, 2),
+        "free_gb": bytes_to_gb(free),
     }
 
-def uptime():
-    seconds = float(subprocess.check_output(
-        ["sysctl", "-n", "kern.boottime"]
-    ).decode().split("sec =")[1].split(",")[0].strip())
-    now = time.time()
-    return round((now - seconds) / 3600, 2)
 
-def generate_report():
-    report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cpu = cpu_load()
-    mem = memory_info()
-    disk = disk_usage("/")
-    up = uptime()
+# -------------------------
+# Evaluation
+# -------------------------
 
-    report = f"""
-SYSTEM HEALTH REPORT
-====================
-Generated: {report_time}
+def evaluate(cpu_pct, mem_avail_gb, disk_used_pct):
+    code = 0
+    msgs = []
 
-CPU Load:
-  1 min : {cpu['1min']}
-  5 min : {cpu['5min']}
-  15 min: {cpu['15min']}
+    if cpu_pct >= 90:
+        code = 2
+        msgs.append(f"CRIT: CPU load {cpu_pct}%")
+    elif cpu_pct >= 70:
+        code = max(code, 1)
+        msgs.append(f"WARN: CPU load {cpu_pct}%")
 
-Memory:
-  Total     : {mem['total_gb']} GB
-  Available : {mem['available_gb']} GB
+    if mem_avail_gb <= 1:
+        code = 2
+        msgs.append(f"CRIT: Memory available {mem_avail_gb} GB")
+    elif mem_avail_gb <= 2:
+        code = max(code, 1)
+        msgs.append(f"WARN: Memory available {mem_avail_gb} GB")
 
-Disk (/):
-  Total : {disk['total_gb']} GB
-  Used  : {disk['used_gb']} GB ({disk['used_pct']}%)
-  Free  : {disk['free_gb']} GB
+    if disk_used_pct >= 95:
+        code = 2
+        msgs.append(f"CRIT: Disk usage {disk_used_pct}%")
+    elif disk_used_pct >= 85:
+        code = max(code, 1)
+        msgs.append(f"WARN: Disk usage {disk_used_pct}%")
 
-System uptime:
-  {up} hours
-"""
-    return report
+    if not msgs:
+        msgs.append("OK: System healthy")
+
+    return code, msgs
+
+
+# -------------------------
+# Main
+# -------------------------
 
 def main():
-    report = generate_report()
-    print(report)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    os.makedirs("reports", exist_ok=True)
-    filename = f"reports/health_{int(time.time())}.txt"
-    with open(filename, "w") as f:
-        f.write(report)
+    cpu = cpu_load()
+    mem = memory_info()
+    disk = disk_usage()
 
-    print(f"Report saved to {filename}")
+    code, alerts = evaluate(cpu, mem["available_gb"], disk["used_pct"])
+
+    print("=" * 40)
+    print("System Health Report")
+    print("Time:", now)
+    print("=" * 40)
+    print(f"CPU Load: {cpu}%")
+    print(f"Memory: {mem['available_gb']} GB free / {mem['total_gb']} GB")
+    print(f"Disk Used: {disk['used_pct']}%")
+    print("-" * 40)
+
+    for a in alerts:
+        print(a)
+
+    print("=" * 40)
+    exit(code)
+
 
 if __name__ == "__main__":
     main()
-
